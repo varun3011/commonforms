@@ -26,8 +26,15 @@ class Widget(BaseModel):
     page: int
 
 
+class TextFragment(BaseModel):
+    text: str
+    x0: float
+    y0: float
+
+
 @dataclass
 class Page:
     image: Image.Image
     width: float
     height: float
+    text_fragments: list[TextFragment]

@@ -3,9 +3,10 @@ import commonforms.exceptions
 
 import formalpdf
 import pytest
+from PIL import Image
 
 from commonforms.inference import promote_signature_widgets
-from commonforms.utils import BoundingBox, Widget
+from commonforms.utils import BoundingBox, Page, TextFragment, Widget
 
 
 def test_inference(tmp_path):
@@ -71,6 +72,26 @@ def test_inference_ffdetr(tmp_path):
 
 
 def test_promote_signature_widgets_uses_signature_label_on_test_pdf():
+    pages = [
+        Page(
+            image=Image.new("RGB", (1, 1)),
+            width=1,
+            height=1,
+            text_fragments=[],
+        ),
+        Page(
+            image=Image.new("RGB", (1, 1)),
+            width=1,
+            height=1,
+            text_fragments=[
+                TextFragment(
+                    text="POLICYHOLDER/PATIENT SIGNATURE FAMILY RELATIONSHIP, IF NOT POLICYHOLDER DATE",
+                    x0=0.37,
+                    y0=0.61,
+                )
+            ],
+        ),
+    ]
     results = {
         1: [
             Widget(
@@ -86,13 +107,21 @@ def test_promote_signature_widgets_uses_signature_label_on_test_pdf():
         ]
     }
 
-    promoted = promote_signature_widgets("./tests/resources/input.pdf", results)
+    promoted = promote_signature_widgets(pages, results)
 
     assert promoted[1][0].widget_type == "Signature"
     assert promoted[1][1].widget_type == "TextBox"
 
 
 def test_promote_signature_widgets_skips_pages_without_signature_label():
+    pages = [
+        Page(
+            image=Image.new("RGB", (1, 1)),
+            width=1,
+            height=1,
+            text_fragments=[TextFragment(text="General contact information", x0=0.1, y0=0.2)],
+        )
+    ]
     results = {
         0: [
             Widget(
@@ -103,7 +132,7 @@ def test_promote_signature_widgets_skips_pages_without_signature_label():
         ]
     }
 
-    promoted = promote_signature_widgets("./tests/resources/input.pdf", results)
+    promoted = promote_signature_widgets(pages, results)
 
     assert promoted[0][0].widget_type == "TextBox"
 

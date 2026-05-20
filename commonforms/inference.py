@@ -1,16 +1,13 @@
 from __future__ import annotations
 from ultralytics import YOLO
 from pathlib import Path
-from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from rfdetr import RFDETRNano, RFDETRBase, RFDETRMedium, RFDETRLarge
 
-from commonforms.utils import BoundingBox, Page, Widget
+from commonforms.utils import BoundingBox, Page, TextFragment, Widget
 from commonforms.form_creator import PyPdfFormCreator
 from commonforms.exceptions import EncryptedPdfError
 
-import formalpdf
-import pypdf
 import pypdfium2
 import logging
 import PIL
@@ -40,7 +37,9 @@ def batch(lst: list, n: int = 8):
 class FFDetrDetector:
     def __init__(self, model_or_path: str, device: int | str = "cpu") -> None:
         self.device = device
-        self.model = RFDETRMedium(pretrain_weights=self.get_model_path(model_or_path))
+        self.model = RFDETRMedium(
+            pretrain_weights=self.get_model_path(model_or_path), device=device
+        )
 
         self.id_to_cls = {0: "TextBox", 1: "ChoiceButton", 2: "Signature"}
 
@@ -75,7 +74,9 @@ class FFDetrDetector:
         image_size = 1024
         results = []
         for b in batch([p.image for p in pages], n=batch_size):
-            predictions = self.model.predict(b, threshold=confidence)
+            predictions = self.model.predict(
+                b, threshold=confidence, device=self.device
+            )
             if isinstance(predictions, list):
                 results.extend(predictions)
             else:
@@ -231,52 +232,67 @@ def sort_widgets(widgets: list[Widget]) -> list[Widget]:
     return [widget for line in lines for widget in line]
 
 
-def render_pdf(pdf_path: str) -> list[Page]:
-    pages = []
-    doc = formalpdf.open(pdf_path)
+def extract_text_fragments(page: pypdfium2.PdfPage) -> list[TextFragment]:
+    textpage = page.get_textpage()
     try:
-        for page in doc:
-            image = page.render(dpi=144)
-            pages.append(Page(image=image, width=image.width, height=image.height))
-        return pages
-    finally:
-        doc.document.close()
+        fragments = []
+        for term in textpage.get_text_range().splitlines():
+            text = term.strip()
+            if not text:
+                continue
 
+            searcher = textpage.search(term, match_case=False, consecutive=True)
+            try:
+                match = searcher.get_next()
+            finally:
+                searcher.close()
 
-@dataclass
-class TextFragment:
-    text: str
-    x0: float
-    y0: float
+            if match is None:
+                continue
 
+            index, count = match
+            rect_count = textpage.count_rects(index, count)
+            rects = [textpage.get_rect(i) for i in range(rect_count)]
+            if not rects:
+                continue
 
-def extract_text_fragments(input_path: str | Path) -> dict[int, list[TextFragment]]:
-    reader = pypdf.PdfReader(str(input_path))
-    try:
-        fragments = {}
-        for page_ix, page in enumerate(reader.pages):
-            box = page.cropbox if page.cropbox else page.mediabox
-            page_width = float(box.right - box.left)
-            page_height = float(box.top - box.bottom)
-            page_fragments: list[TextFragment] = []
-
-            def visitor(text, cm, tm, font_dict, font_size):
-                if not text.strip():
-                    return
-
-                x0 = float(tm[4] - box.left) / page_width
-                y0 = 1 - (float(tm[5] - box.bottom) / page_height)
-                page_fragments.append(TextFragment(text=text, x0=x0, y0=y0))
-
-            page.extract_text(visitor_text=visitor)
-            fragments[page_ix] = page_fragments
+            left = min(rect[0] for rect in rects)
+            top = max(rect[3] for rect in rects)
+            fragments.append(
+                TextFragment(
+                    text=text,
+                    x0=left / page.get_width(),
+                    y0=1 - (top / page.get_height()),
+                )
+            )
 
         return fragments
     finally:
-        reader.close()
+        textpage.close()
 
 
-def group_widget_rows(widgets: list[Widget], y_threshold: float = 0.015) -> list[list[Widget]]:
+def render_pdf(pdf_path: str) -> list[Page]:
+    pages = []
+    doc = pypdfium2.PdfDocument(pdf_path)
+    try:
+        for page in doc:
+            image = page.render(scale=2).to_pil()
+            pages.append(
+                Page(
+                    image=image,
+                    width=image.width,
+                    height=image.height,
+                    text_fragments=extract_text_fragments(page),
+                )
+            )
+        return pages
+    finally:
+        doc.close()
+
+
+def group_widget_rows(
+    widgets: list[Widget], y_threshold: float = 0.015
+) -> list[list[Widget]]:
     rows: list[list[Widget]] = []
     for widget in sorted(widgets, key=lambda item: item.bounding_box.y0):
         if (
@@ -290,10 +306,12 @@ def group_widget_rows(widgets: list[Widget], y_threshold: float = 0.015) -> list
 
 
 def promote_signature_widgets(
-    input_path: str | Path, results: dict[int, list[Widget]]
+    pages: list[Page],
+    results: dict[int, list[Widget]],
+    signature_label_terms: tuple[str, ...] = ("signature",),
 ) -> dict[int, list[Widget]]:
     """Promote likely signature fields by matching signature labels to nearby rows."""
-    text_fragments = extract_text_fragments(input_path)
+    normalized_terms = tuple(term.lower() for term in signature_label_terms)
 
     for page_ix, widgets in results.items():
         if any(widget.widget_type == "Signature" for widget in widgets):
@@ -301,8 +319,8 @@ def promote_signature_widgets(
 
         signature_labels = [
             fragment
-            for fragment in text_fragments.get(page_ix, [])
-            if "signature" in fragment.text.lower()
+            for fragment in pages[page_ix].text_fragments
+            if any(term in fragment.text.lower() for term in normalized_terms)
         ]
         if not signature_labels:
             continue
@@ -321,9 +339,6 @@ def promote_signature_widgets(
             row_width = row_right - row_left
 
             for label in signature_labels:
-                if row_y <= label.y0:
-                    continue
-
                 horizontal_penalty = 0.0
                 if label.x0 < row_left:
                     horizontal_penalty = row_left - label.x0
@@ -332,9 +347,10 @@ def promote_signature_widgets(
 
                 score = (
                     horizontal_penalty,
+                    abs(row_y - label.y0),
                     abs(row_left - label.x0),
-                    -row_y,
                     -row_width,
+                    -row_y,
                 )
                 scored_rows.append((score, row))
 
@@ -362,11 +378,12 @@ def prepare_form(
     fast: bool = False,
     multiline: bool = False,
     batch_size: int = 4,
+    signature_label_terms: tuple[str, ...] = ("signature",),
 ):
     if "FFDNET" in model_or_path.upper():
         detector = FFDNetDetector(model_or_path, device=device, fast=fast)
     else:
-        detector = FFDetrDetector(model_or_path)
+        detector = FFDetrDetector(model_or_path, device=device)
 
     try:
         pages = render_pdf(input_path)
@@ -381,7 +398,11 @@ def prepare_form(
         results = detector.extract_widgets(
             pages, confidence=confidence, image_size=image_size
         )
-    results = promote_signature_widgets(input_path, results)
+
+    if use_signature_fields:
+        results = promote_signature_widgets(
+            pages, results, signature_label_terms=signature_label_terms
+        )
 
     writer = PyPdfFormCreator(input_path)
     if not keep_existing_fields:
