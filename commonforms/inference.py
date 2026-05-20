@@ -1,6 +1,7 @@
 from __future__ import annotations
 from ultralytics import YOLO
 from pathlib import Path
+from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from rfdetr import RFDETRNano, RFDETRBase, RFDETRMedium, RFDETRLarge
 
@@ -9,6 +10,7 @@ from commonforms.form_creator import PyPdfFormCreator
 from commonforms.exceptions import EncryptedPdfError
 
 import formalpdf
+import pypdf
 import pypdfium2
 import logging
 import PIL
@@ -241,6 +243,112 @@ def render_pdf(pdf_path: str) -> list[Page]:
         doc.document.close()
 
 
+@dataclass
+class TextFragment:
+    text: str
+    x0: float
+    y0: float
+
+
+def extract_text_fragments(input_path: str | Path) -> dict[int, list[TextFragment]]:
+    reader = pypdf.PdfReader(str(input_path))
+    try:
+        fragments = {}
+        for page_ix, page in enumerate(reader.pages):
+            box = page.cropbox if page.cropbox else page.mediabox
+            page_width = float(box.right - box.left)
+            page_height = float(box.top - box.bottom)
+            page_fragments: list[TextFragment] = []
+
+            def visitor(text, cm, tm, font_dict, font_size):
+                if not text.strip():
+                    return
+
+                x0 = float(tm[4] - box.left) / page_width
+                y0 = 1 - (float(tm[5] - box.bottom) / page_height)
+                page_fragments.append(TextFragment(text=text, x0=x0, y0=y0))
+
+            page.extract_text(visitor_text=visitor)
+            fragments[page_ix] = page_fragments
+
+        return fragments
+    finally:
+        reader.close()
+
+
+def group_widget_rows(widgets: list[Widget], y_threshold: float = 0.015) -> list[list[Widget]]:
+    rows: list[list[Widget]] = []
+    for widget in sorted(widgets, key=lambda item: item.bounding_box.y0):
+        if (
+            rows
+            and abs(widget.bounding_box.y0 - rows[-1][0].bounding_box.y0) <= y_threshold
+        ):
+            rows[-1].append(widget)
+        else:
+            rows.append([widget])
+    return rows
+
+
+def promote_signature_widgets(
+    input_path: str | Path, results: dict[int, list[Widget]]
+) -> dict[int, list[Widget]]:
+    """Promote likely signature fields by matching signature labels to nearby rows."""
+    text_fragments = extract_text_fragments(input_path)
+
+    for page_ix, widgets in results.items():
+        if any(widget.widget_type == "Signature" for widget in widgets):
+            continue
+
+        signature_labels = [
+            fragment
+            for fragment in text_fragments.get(page_ix, [])
+            if "signature" in fragment.text.lower()
+        ]
+        if not signature_labels:
+            continue
+
+        textbox_rows = group_widget_rows(
+            [widget for widget in widgets if widget.widget_type == "TextBox"]
+        )
+        if not textbox_rows:
+            continue
+
+        scored_rows = []
+        for row in textbox_rows:
+            row_left = min(widget.bounding_box.x0 for widget in row)
+            row_right = max(widget.bounding_box.x1 for widget in row)
+            row_y = sum(widget.bounding_box.y0 for widget in row) / len(row)
+            row_width = row_right - row_left
+
+            for label in signature_labels:
+                if row_y <= label.y0:
+                    continue
+
+                horizontal_penalty = 0.0
+                if label.x0 < row_left:
+                    horizontal_penalty = row_left - label.x0
+                elif label.x0 > row_right:
+                    horizontal_penalty = label.x0 - row_right
+
+                score = (
+                    horizontal_penalty,
+                    abs(row_left - label.x0),
+                    -row_y,
+                    -row_width,
+                )
+                scored_rows.append((score, row))
+
+        if not scored_rows:
+            continue
+
+        best_row = min(scored_rows, key=lambda item: item[0])[1]
+        candidate = min(best_row, key=lambda widget: widget.bounding_box.x0)
+        widget_ix = widgets.index(candidate)
+        widgets[widget_ix] = candidate.model_copy(update={"widget_type": "Signature"})
+
+    return results
+
+
 def prepare_form(
     input_path: str | Path,
     output_path: str | Path,
@@ -273,6 +381,7 @@ def prepare_form(
         results = detector.extract_widgets(
             pages, confidence=confidence, image_size=image_size
         )
+    results = promote_signature_widgets(input_path, results)
 
     writer = PyPdfFormCreator(input_path)
     if not keep_existing_fields:

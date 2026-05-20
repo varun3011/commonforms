@@ -4,6 +4,9 @@ import commonforms.exceptions
 import formalpdf
 import pytest
 
+from commonforms.inference import promote_signature_widgets
+from commonforms.utils import BoundingBox, Widget
+
 
 def test_inference(tmp_path):
     # tmp_path is a built-in pythest fixture where we'll write the outputs
@@ -65,6 +68,44 @@ def test_inference_ffdetr(tmp_path):
     assert len(doc[0].widgets()) > 0
 
     doc.document.close()
+
+
+def test_promote_signature_widgets_uses_signature_label_on_test_pdf():
+    results = {
+        1: [
+            Widget(
+                widget_type="TextBox",
+                bounding_box=BoundingBox(x0=0.089, y0=0.857, x1=0.384, y1=0.895),
+                page=1,
+            ),
+            Widget(
+                widget_type="TextBox",
+                bounding_box=BoundingBox(x0=0.752, y0=0.859, x1=0.927, y1=0.896),
+                page=1,
+            ),
+        ]
+    }
+
+    promoted = promote_signature_widgets("./tests/resources/input.pdf", results)
+
+    assert promoted[1][0].widget_type == "Signature"
+    assert promoted[1][1].widget_type == "TextBox"
+
+
+def test_promote_signature_widgets_skips_pages_without_signature_label():
+    results = {
+        0: [
+            Widget(
+                widget_type="TextBox",
+                bounding_box=BoundingBox(x0=0.1, y0=0.8, x1=0.3, y1=0.84),
+                page=0,
+            )
+        ]
+    }
+
+    promoted = promote_signature_widgets("./tests/resources/input.pdf", results)
+
+    assert promoted[0][0].widget_type == "TextBox"
 
 
 # TODO(joe): future tests around handling encrypted PDFs
